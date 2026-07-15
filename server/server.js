@@ -102,7 +102,7 @@ async function chatWithGroq(history) {
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.5 }),
+      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.5, max_tokens: 150 }),
     });
     if (!response.ok) {
       throw new Error(`Groq API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
@@ -154,6 +154,7 @@ async function chatWithGemini(history) {
           systemInstruction: { parts: [{ text: buildSupportPrompt() }] },
           contents,
           tools: [{ functionDeclarations: SUPPORT_FUNCTIONS }],
+          generationConfig: { maxOutputTokens: 150 },
         }),
       }
     );
@@ -390,9 +391,10 @@ const SUPPORT_FUNCTIONS = [
 function buildSupportPrompt() {
   return [
     "You are a friendly customer support agent for the company described in the knowledge base below.",
-    "You are speaking with a customer over voice, so keep replies short, natural, and conversational — one or two sentences unless more detail is needed.",
+    "You are speaking with a customer over voice. Be SHORT and CRISP: answer in ONE brief sentence whenever possible, two at most. No filler, no repeating the question, no lists — just the answer.",
+    "Give only the detail the customer asked for; they will ask a follow-up if they want more.",
     "Answer ONLY from the knowledge base and the tools available to you. If the customer asks about an order, ask for their order number and use the get_order_status function.",
-    "If you don't know the answer or the request is outside your knowledge, say so and offer the support email instead of guessing.",
+    "If you don't know the answer or the request is outside your knowledge, say so briefly and offer the support email instead of guessing.",
     "",
     "=== KNOWLEDGE BASE ===",
     loadKnowledge(),
