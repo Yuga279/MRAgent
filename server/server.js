@@ -102,7 +102,7 @@ async function chatWithGroq(history) {
         Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.5, max_tokens: 150 }),
+      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.3, max_tokens: 100 }),
     });
     if (!response.ok) {
       throw new Error(`Groq API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
@@ -141,6 +141,7 @@ async function chatWithGemini(history) {
     parts: [{ text: m.content }],
   }));
 
+  let retriedMalformed = false;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
@@ -154,7 +155,9 @@ async function chatWithGemini(history) {
           systemInstruction: { parts: [{ text: buildSupportPrompt() }] },
           contents,
           tools: [{ functionDeclarations: SUPPORT_FUNCTIONS }],
-          generationConfig: { maxOutputTokens: 150 },
+          // thinkingBudget 0 disables 2.5-flash "thinking", which otherwise
+          // consumes the output budget and truncates short replies.
+          generationConfig: { maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } },
         }),
       }
     );
@@ -162,6 +165,11 @@ async function chatWithGemini(history) {
       throw new Error(`Gemini API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
     }
     const candidate = (await response.json()).candidates?.[0];
+    if (candidate?.finishReason === "MALFORMED_FUNCTION_CALL" && !retriedMalformed) {
+      retriedMalformed = true;
+      round--;
+      continue;
+    }
     const parts = candidate?.content?.parts || [];
     const functionCalls = parts.filter((p) => p.functionCall);
 
@@ -211,7 +219,8 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
-    const reply = await (chosen === "groq" ? chatWithGroq : chatWithGemini)(history);
+    const reply = sanitizeReply(await (chosen === "groq" ? chatWithGroq : chatWithGemini)(history));
+    if (!reply) throw new Error("The model returned an empty reply");
     res.json({ reply, provider: chosen });
   } catch (error) {
     console.error("Chat error:", error);
@@ -366,8 +375,36 @@ function getOrderStatus(orderId) {
   }
 }
 
+function placeOrder(product, shipping) {
+  try {
+    const ordersPath = path.join(DATA_DIR, "orders.json");
+    const orders = JSON.parse(fs.readFileSync(ordersPath, "utf8"));
+    const nextId = String(
+      orders.reduce((max, o) => Math.max(max, Number(o.order_id) || 0), 1000) + 1
+    );
+    const shipDays = shipping === "express" ? 1 : 3;
+    const shipDate = new Date(Date.now() + shipDays * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const order = {
+      order_id: nextId,
+      status: "processing",
+      items: [product],
+      shipping: shipping === "express" ? "express" : "standard",
+      estimated_ship_date: shipDate,
+    };
+    orders.push(order);
+    fs.writeFileSync(ordersPath, JSON.stringify(orders, null, 2) + "\n");
+    return { success: true, ...order };
+  } catch (error) {
+    console.error("Place order error:", error);
+    return { success: false, message: "The order system is temporarily unavailable." };
+  }
+}
+
 const FUNCTION_HANDLERS = {
   get_order_status: (args) => getOrderStatus(args.order_id),
+  place_order: (args) => placeOrder(args.product, args.shipping),
 };
 
 const SUPPORT_FUNCTIONS = [
@@ -386,19 +423,53 @@ const SUPPORT_FUNCTIONS = [
       required: ["order_id"],
     },
   },
+  {
+    name: "place_order",
+    description:
+      "Place a new order for a product from the catalog once the customer has confirmed they want to buy it. Returns the new order number.",
+    parameters: {
+      type: "object",
+      properties: {
+        product: {
+          type: "string",
+          description: "Exact product name from the catalog, e.g. HomeCam 360",
+        },
+        shipping: {
+          type: "string",
+          enum: ["standard", "express"],
+          description: "Shipping method the customer chose (default standard)",
+        },
+      },
+      required: ["product"],
+    },
+  },
 ];
 
 function buildSupportPrompt() {
   return [
-    "You are a friendly customer support agent for the company described in the knowledge base below.",
-    "You are speaking with a customer over voice. Be SHORT and CRISP: answer in ONE brief sentence whenever possible, two at most. No filler, no repeating the question, no lists — just the answer.",
-    "Give only the detail the customer asked for; they will ask a follow-up if they want more.",
-    "Answer ONLY from the knowledge base and the tools available to you. If the customer asks about an order, ask for their order number and use the get_order_status function.",
-    "If you don't know the answer or the request is outside your knowledge, say so briefly and offer the support email instead of guessing.",
+    "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone.",
+    "RULES — follow every one:",
+    "1. Reply in ONE short sentence of plain spoken English, 20 words or fewer. Never use lists, headings, or long explanations.",
+    "2. Give only what was asked. The customer will follow up if they want more.",
+    "3. Answer ONLY from the knowledge base and your functions. If you don't know, say so in one sentence and offer the support email.",
+    "4. For order status questions, ask for the order number and use get_order_status.",
+    "5. When the customer confirms they want to buy a product, call place_order and tell them just the new order number and ship date. Never invent order numbers or tracking details.",
+    "6. Never mention functions, tools, or JSON, and never write function-call syntax in your reply — functions are called silently through the API.",
     "",
     "=== KNOWLEDGE BASE ===",
     loadKnowledge(),
   ].join("\n");
+}
+
+// Some models (notably Llama) occasionally leak tool-call markup into their
+// text reply — strip it so it is never spoken to the customer.
+function sanitizeReply(text) {
+  return (text || "")
+    .replace(/<function[\s\S]*?<\/function>/gi, "")
+    .replace(/<function=[^>]*>?/gi, "")
+    .replace(/<\/?tool_call>/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function buildAgentSettings() {
