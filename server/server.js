@@ -7,6 +7,15 @@ const WebSocket = require("ws");
 const { DeepgramClient } = require("@deepgram/sdk");
 const fs = require("fs");
 
+// Support-agent domain logic (knowledge base, order functions with consent
+// guards, prompt) — in its own module so it can be unit-tested.
+const {
+  FUNCTION_HANDLERS,
+  SUPPORT_FUNCTIONS,
+  buildSupportPrompt,
+  sanitizeReply,
+} = require("./src/support.js");
+
 const app = express();
 const server = http.createServer(app);
 // Two WebSocket endpoints on one HTTP server: each WebSocket.Server with its
@@ -88,11 +97,19 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const MAX_TOOL_ROUNDS = 4;
 
+function lastUserContent(history) {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "user") return history[i].content;
+  }
+  return "";
+}
+
 async function chatWithGroq(history) {
   const messages = [
     { role: "system", content: buildSupportPrompt() },
     ...history,
   ];
+  const context = { lastUserMessage: lastUserContent(history) };
   const tools = SUPPORT_FUNCTIONS.map((fn) => ({ type: "function", function: fn }));
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -120,7 +137,7 @@ async function chatWithGroq(history) {
         } catch {
           // leave args empty
         }
-        const result = handler ? handler(args) : { error: `Unknown function: ${call.function?.name}` };
+        const result = handler ? handler(args, context) : { error: `Unknown function: ${call.function?.name}` };
         console.log(`Chat function call (groq): ${call.function?.name} →`, result);
         messages.push({
           role: "tool",
@@ -136,6 +153,7 @@ async function chatWithGroq(history) {
 }
 
 async function chatWithGemini(history) {
+  const context = { lastUserMessage: lastUserContent(history) };
   const contents = history.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }],
@@ -180,7 +198,7 @@ async function chatWithGemini(history) {
         parts: functionCalls.map((p) => {
           const handler = FUNCTION_HANDLERS[p.functionCall.name];
           const result = handler
-            ? handler(p.functionCall.args || {})
+            ? handler(p.functionCall.args || {}, context)
             : { error: `Unknown function: ${p.functionCall.name}` };
           console.log(`Chat function call (gemini): ${p.functionCall.name} →`, result);
           return {
@@ -348,129 +366,6 @@ wss.on("connection", async (ws) => {
 // the agent WebSocket endpoint directly.
 const AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse";
 
-// Customer data lives in server/data/ — knowledge.md is injected into the
-// agent's prompt on every new conversation, orders.json backs the
-// get_order_status function the agent can call mid-conversation.
-const DATA_DIR = path.join(__dirname, "data");
-
-function loadKnowledge() {
-  try {
-    return fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function getOrderStatus(orderId) {
-  try {
-    const orders = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "orders.json"), "utf8"));
-    const order = orders.find((o) => String(o.order_id) === String(orderId).trim());
-    if (!order) {
-      return { found: false, message: `No order found with ID ${orderId}. Ask the customer to double-check the order number.` };
-    }
-    return { found: true, ...order };
-  } catch (error) {
-    console.error("Order lookup error:", error);
-    return { found: false, message: "The order system is temporarily unavailable." };
-  }
-}
-
-function placeOrder(product, shipping) {
-  try {
-    const ordersPath = path.join(DATA_DIR, "orders.json");
-    const orders = JSON.parse(fs.readFileSync(ordersPath, "utf8"));
-    const nextId = String(
-      orders.reduce((max, o) => Math.max(max, Number(o.order_id) || 0), 1000) + 1
-    );
-    const shipDays = shipping === "express" ? 1 : 3;
-    const shipDate = new Date(Date.now() + shipDays * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .slice(0, 10);
-    const order = {
-      order_id: nextId,
-      status: "processing",
-      items: [product],
-      shipping: shipping === "express" ? "express" : "standard",
-      estimated_ship_date: shipDate,
-    };
-    orders.push(order);
-    fs.writeFileSync(ordersPath, JSON.stringify(orders, null, 2) + "\n");
-    return { success: true, ...order };
-  } catch (error) {
-    console.error("Place order error:", error);
-    return { success: false, message: "The order system is temporarily unavailable." };
-  }
-}
-
-const FUNCTION_HANDLERS = {
-  get_order_status: (args) => getOrderStatus(args.order_id),
-  place_order: (args) => placeOrder(args.product, args.shipping),
-};
-
-const SUPPORT_FUNCTIONS = [
-  {
-    name: "get_order_status",
-    description:
-      "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
-    parameters: {
-      type: "object",
-      properties: {
-        order_id: {
-          type: "string",
-          description: "The customer's order number, e.g. 1001",
-        },
-      },
-      required: ["order_id"],
-    },
-  },
-  {
-    name: "place_order",
-    description:
-      "Place a new order for a product from the catalog once the customer has confirmed they want to buy it. Returns the new order number.",
-    parameters: {
-      type: "object",
-      properties: {
-        product: {
-          type: "string",
-          description: "Exact product name from the catalog, e.g. HomeCam 360",
-        },
-        shipping: {
-          type: "string",
-          enum: ["standard", "express"],
-          description: "Shipping method the customer chose (default standard)",
-        },
-      },
-      required: ["product"],
-    },
-  },
-];
-
-function buildSupportPrompt() {
-  return [
-    "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone.",
-    "RULES — follow every one:",
-    "1. Reply in ONE short sentence of plain spoken English, 20 words or fewer. Never use lists, headings, or long explanations.",
-    "2. Give only what was asked. The customer will follow up if they want more.",
-    "3. Answer ONLY from the knowledge base and your functions. If you don't know, say so in one sentence and offer the support email.",
-    "4. For order status questions, ask for the order number and use get_order_status.",
-    "5. When the customer confirms they want to buy a product, call place_order and tell them just the new order number and ship date. Never invent order numbers or tracking details.",
-    "6. Never mention functions, tools, or JSON, and never write function-call syntax in your reply — functions are called silently through the API.",
-    "",
-    "=== KNOWLEDGE BASE ===",
-    loadKnowledge(),
-  ].join("\n");
-}
-
-// Some models (notably Llama) occasionally leak tool-call markup into their
-// text reply — strip it so it is never spoken to the customer.
-function sanitizeReply(text) {
-  return (text || "")
-    .replace(/<function[\s\S]*?<\/function>/gi, "")
-    .replace(/<function=[^>]*>?/gi, "")
-    .replace(/<\/?tool_call>/gi, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
 
 function buildAgentSettings() {
   return {
@@ -492,7 +387,7 @@ function buildAgentSettings() {
   };
 }
 
-function handleFunctionCallRequest(dgWs, message) {
+function handleFunctionCallRequest(dgWs, message, context = {}) {
   for (const call of message.functions || []) {
     if (!call.client_side) continue;
     const handler = FUNCTION_HANDLERS[call.name];
@@ -506,7 +401,7 @@ function handleFunctionCallRequest(dgWs, message) {
       } catch {
         // leave args empty
       }
-      result = handler(args);
+      result = handler(args, context);
     }
     console.log(`Function call: ${call.name}(${call.arguments}) →`, result);
     dgWs.send(
@@ -542,12 +437,19 @@ agentWss.on("connection", (browserWs) => {
     }
   });
 
+  // Track the customer's most recent utterance so function handlers can
+  // verify consent server-side (same guard as the free-mode /api/chat path).
+  const conversationContext = { lastUserMessage: "" };
+
   dgWs.on("message", (data, isBinary) => {
     if (!isBinary) {
       try {
         const message = JSON.parse(data.toString());
+        if (message.type === "ConversationText" && message.role === "user") {
+          conversationContext.lastUserMessage = message.content || "";
+        }
         if (message.type === "FunctionCallRequest") {
-          handleFunctionCallRequest(dgWs, message);
+          handleFunctionCallRequest(dgWs, message, conversationContext);
         }
       } catch {
         // forward unparseable text frames as-is
