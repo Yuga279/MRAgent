@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(node --version; npm --version; where.exe node; if \\(Test-Path \"$env:NVM_HOME\"\\) { nvm list })",
+      "PowerShell($env:DEEPGRAM_API_KEY = 'dummy-key-for-startup-test'; Start-Process -FilePath node -ArgumentList 'server.js' -RedirectStandardOutput scratch-server-out.txt -RedirectStandardError scratch-server-err.txt -PassThru | ForEach-Object { $_.Id } | Out-File server-pid.txt -Encoding ascii; Start-Sleep -Seconds 2; Invoke-WebRequest -UseBasicParsing http://localhost:3000/ | Select-Object StatusCode; Get-Content scratch-server-out.txt)"
+    ]
+  }
+}
