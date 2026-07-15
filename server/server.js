@@ -191,23 +191,108 @@ wss.on("connection", async (ws) => {
 // the agent WebSocket endpoint directly.
 const AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse";
 
-const AGENT_SETTINGS = {
-  type: "Settings",
-  audio: {
-    input: { encoding: "linear16", sample_rate: 24000 },
-    output: { encoding: "linear16", sample_rate: 24000, container: "none" },
-  },
-  agent: {
-    listen: { provider: { type: "deepgram", model: "nova-3" } },
-    think: {
-      provider: { type: "open_ai", model: "gpt-4o-mini", temperature: 0.7 },
-      prompt:
-        "You are a friendly voice assistant. Keep your replies short, conversational, and helpful — one or two sentences unless more detail is requested.",
-    },
-    speak: { provider: { type: "deepgram", model: "aura-2-thalia-en" } },
-    greeting: "Hello! How can I help you today?",
-  },
+// Customer data lives in server/data/ — knowledge.md is injected into the
+// agent's prompt on every new conversation, orders.json backs the
+// get_order_status function the agent can call mid-conversation.
+const DATA_DIR = path.join(__dirname, "data");
+
+function loadKnowledge() {
+  try {
+    return fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function getOrderStatus(orderId) {
+  try {
+    const orders = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "orders.json"), "utf8"));
+    const order = orders.find((o) => String(o.order_id) === String(orderId).trim());
+    if (!order) {
+      return { found: false, message: `No order found with ID ${orderId}. Ask the customer to double-check the order number.` };
+    }
+    return { found: true, ...order };
+  } catch (error) {
+    console.error("Order lookup error:", error);
+    return { found: false, message: "The order system is temporarily unavailable." };
+  }
+}
+
+const FUNCTION_HANDLERS = {
+  get_order_status: (args) => getOrderStatus(args.order_id),
 };
+
+function buildAgentSettings() {
+  return {
+    type: "Settings",
+    audio: {
+      input: { encoding: "linear16", sample_rate: 24000 },
+      output: { encoding: "linear16", sample_rate: 24000, container: "none" },
+    },
+    agent: {
+      listen: { provider: { type: "deepgram", model: "nova-3" } },
+      think: {
+        provider: { type: "open_ai", model: "gpt-4o-mini", temperature: 0.5 },
+        prompt: [
+          "You are a friendly customer support agent for the company described in the knowledge base below.",
+          "You are speaking with a customer over voice, so keep replies short, natural, and conversational — one or two sentences unless more detail is needed.",
+          "Answer ONLY from the knowledge base and the tools available to you. If the customer asks about an order, ask for their order number and use the get_order_status function.",
+          "If you don't know the answer or the request is outside your knowledge, say so and offer the support email instead of guessing.",
+          "",
+          "=== KNOWLEDGE BASE ===",
+          loadKnowledge(),
+        ].join("\n"),
+        functions: [
+          {
+            name: "get_order_status",
+            description:
+              "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
+            parameters: {
+              type: "object",
+              properties: {
+                order_id: {
+                  type: "string",
+                  description: "The customer's order number, e.g. 1001",
+                },
+              },
+              required: ["order_id"],
+            },
+          },
+        ],
+      },
+      speak: { provider: { type: "deepgram", model: "aura-2-thalia-en" } },
+      greeting: "Hi! Thanks for calling Acme Gadgets support. How can I help you today?",
+    },
+  };
+}
+
+function handleFunctionCallRequest(dgWs, message) {
+  for (const call of message.functions || []) {
+    if (!call.client_side) continue;
+    const handler = FUNCTION_HANDLERS[call.name];
+    let result;
+    if (!handler) {
+      result = { error: `Unknown function: ${call.name}` };
+    } else {
+      let args = {};
+      try {
+        args = JSON.parse(call.arguments || "{}");
+      } catch {
+        // leave args empty
+      }
+      result = handler(args);
+    }
+    console.log(`Function call: ${call.name}(${call.arguments}) →`, result);
+    dgWs.send(
+      JSON.stringify({
+        type: "FunctionCallResponse",
+        id: call.id,
+        name: call.name,
+        content: JSON.stringify(result),
+      })
+    );
+  }
+}
 
 agentWss.on("connection", (browserWs) => {
   console.log("Agent client connected");
@@ -219,13 +304,23 @@ agentWss.on("connection", (browserWs) => {
 
   dgWs.on("open", () => {
     console.log("Deepgram agent connection opened");
-    dgWs.send(JSON.stringify(AGENT_SETTINGS));
+    dgWs.send(JSON.stringify(buildAgentSettings()));
     while (pending.length > 0) {
       dgWs.send(pending.shift());
     }
   });
 
   dgWs.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.type === "FunctionCallRequest") {
+          handleFunctionCallRequest(dgWs, message);
+        }
+      } catch {
+        // forward unparseable text frames as-is
+      }
+    }
     if (browserWs.readyState === WebSocket.OPEN) {
       browserWs.send(data, { binary: isBinary });
     }

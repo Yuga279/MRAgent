@@ -110,6 +110,9 @@ export default function AgentPanel() {
         case "AgentThinking":
           setAgentState("Thinking…");
           break;
+        case "FunctionCallRequest":
+          setAgentState("Looking that up…");
+          break;
         case "AgentStartedSpeaking":
           setAgentState("Speaking…");
           break;
@@ -230,7 +233,8 @@ export default function AgentPanel() {
       <div className="chat">
         {messages.length === 0 && (
           <p className="placeholder">
-            Start a conversation and talk to the agent — it listens, thinks, and talks back.
+            Start a conversation and talk to the support agent — it answers from the company
+            knowledge base and can look up orders.
           </p>
         )}
         {messages.map((message, i) => (

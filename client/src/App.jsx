@@ -7,12 +7,12 @@ export default function App() {
 
   return (
     <div className="container">
-      <h1>🎙️ Voice Agent</h1>
-      <p className="subtitle">Powered by Deepgram</p>
+      <h1>🎧 Customer Support Agent</h1>
+      <p className="subtitle">Natural voice support, powered by Deepgram</p>
 
       <div className="tabs">
         <button className={tab === "agent" ? "active" : ""} onClick={() => setTab("agent")}>
-          Voice Agent
+          Support Agent
         </button>
         <button
           className={tab === "transcribe" ? "active" : ""}

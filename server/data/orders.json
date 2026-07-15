@@ -1,0 +1,25 @@
+[
+  {
+    "order_id": "1001",
+    "customer_name": "Jane Smith",
+    "status": "shipped",
+    "items": ["HomeCam 360"],
+    "carrier": "UPS",
+    "tracking_number": "1Z999AA10123456784",
+    "estimated_delivery": "2026-07-18"
+  },
+  {
+    "order_id": "1002",
+    "customer_name": "Carlos Rivera",
+    "status": "processing",
+    "items": ["SmartPlug Mini", "DoorSense Pro"],
+    "estimated_ship_date": "2026-07-16"
+  },
+  {
+    "order_id": "1003",
+    "customer_name": "Amara Okafor",
+    "status": "delivered",
+    "items": ["ThermoSense"],
+    "delivered_on": "2026-07-10"
+  }
+]
