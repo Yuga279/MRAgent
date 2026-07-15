@@ -1,6 +1,9 @@
-# Real-time voice transcription (React + Node + Deepgram)
+# Real-time voice agent (React + Node + Deepgram)
 
-A real-time voice app: the React frontend captures your microphone in the browser and streams audio over WebSocket to the Node backend, which relays it to Deepgram live transcription and streams the results back as you speak.
+A real-time voice app with two modes:
+
+- **Voice Agent** — talk naturally with an AI agent (Deepgram Voice Agent API: speech-to-text → LLM → text-to-speech, with barge-in support). The browser streams your mic to the Node backend, which relays to Deepgram; the agent's voice and the conversation text stream back live.
+- **Transcribe** — live speech-to-text of your microphone, with a "Listen" button that reads the transcript back using Deepgram TTS.
 
 ```
 client/   React + Vite frontend

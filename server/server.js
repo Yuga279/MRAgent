@@ -9,7 +9,22 @@ const fs = require("fs");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: "/ws" });
+// Two WebSocket endpoints on one HTTP server: each WebSocket.Server with its
+// own `path` would 400 upgrades for the other's path, so route upgrades manually.
+const wss = new WebSocket.Server({ noServer: true });
+const agentWss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+  const target = pathname === "/ws" ? wss : pathname === "/ws-agent" ? agentWss : null;
+  if (!target) {
+    socket.destroy();
+    return;
+  }
+  target.handleUpgrade(request, socket, head, (ws) => {
+    target.emit("connection", ws, request);
+  });
+});
 
 const apiKey = process.env.DEEPGRAM_API_KEY;
 
@@ -168,6 +183,87 @@ wss.on("connection", async (ws) => {
       ws.close();
     }
   }
+});
+
+// Voice Agent relay: browser mic PCM → Deepgram Agent (STT + LLM + TTS) →
+// agent audio (binary) and events (JSON) back to the browser. The SDK's agent
+// socket JSON-parses every frame, which breaks on binary audio, so we talk to
+// the agent WebSocket endpoint directly.
+const AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse";
+
+const AGENT_SETTINGS = {
+  type: "Settings",
+  audio: {
+    input: { encoding: "linear16", sample_rate: 24000 },
+    output: { encoding: "linear16", sample_rate: 24000, container: "none" },
+  },
+  agent: {
+    listen: { provider: { type: "deepgram", model: "nova-3" } },
+    think: {
+      provider: { type: "open_ai", model: "gpt-4o-mini", temperature: 0.7 },
+      prompt:
+        "You are a friendly voice assistant. Keep your replies short, conversational, and helpful — one or two sentences unless more detail is requested.",
+    },
+    speak: { provider: { type: "deepgram", model: "aura-2-thalia-en" } },
+    greeting: "Hello! How can I help you today?",
+  },
+};
+
+agentWss.on("connection", (browserWs) => {
+  console.log("Agent client connected");
+
+  const dgWs = new WebSocket(AGENT_URL, {
+    headers: { Authorization: `Token ${apiKey}` },
+  });
+  const pending = [];
+
+  dgWs.on("open", () => {
+    console.log("Deepgram agent connection opened");
+    dgWs.send(JSON.stringify(AGENT_SETTINGS));
+    while (pending.length > 0) {
+      dgWs.send(pending.shift());
+    }
+  });
+
+  dgWs.on("message", (data, isBinary) => {
+    if (browserWs.readyState === WebSocket.OPEN) {
+      browserWs.send(data, { binary: isBinary });
+    }
+  });
+
+  dgWs.on("close", () => {
+    console.log("Deepgram agent connection closed");
+    if (browserWs.readyState === WebSocket.OPEN) {
+      browserWs.close();
+    }
+  });
+
+  dgWs.on("error", (error) => {
+    console.error("Deepgram agent error:", error);
+    if (browserWs.readyState === WebSocket.OPEN) {
+      browserWs.send(JSON.stringify({ type: "Error", description: error.message }));
+      browserWs.close();
+    }
+  });
+
+  browserWs.on("message", (data, isBinary) => {
+    if (dgWs.readyState === WebSocket.OPEN) {
+      dgWs.send(data, { binary: isBinary });
+    } else if (dgWs.readyState === WebSocket.CONNECTING) {
+      pending.push(data);
+    }
+  });
+
+  browserWs.on("close", () => {
+    console.log("Agent client disconnected");
+    if (dgWs.readyState === WebSocket.OPEN || dgWs.readyState === WebSocket.CONNECTING) {
+      dgWs.close();
+    }
+  });
+
+  browserWs.on("error", (error) => {
+    console.error("Agent client WebSocket error:", error);
+  });
 });
 
 const PORT = process.env.PORT || 3000;

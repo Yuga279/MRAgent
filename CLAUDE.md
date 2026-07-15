@@ -4,10 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Real-time voice transcription app split into two sibling packages:
+Real-time voice app (live transcription + conversational voice agent) split into two sibling packages:
 
-- [server/](server/) — Express + `ws` backend ([server/server.js](server/server.js)). WebSocket relay mounted at `/ws`: browser audio → Deepgram live transcription (`client.listen.v1.connect`, `nova-3` model) → results back to the browser. Also `POST /api/tts` — Deepgram Aura TTS (`client.speak.v1.audio.generate`, `aura-2-thalia-en`) returning MP3; long text is split into ≤1900-char sentence chunks and the MP3 buffers concatenated (Deepgram caps TTS at 2000 chars/request). Serves the built React app from `client/dist` at http://localhost:3000 (port via `PORT`). Loads `server/.env` via `dotenv`. Also contains a separate batch transcription CLI ([server/src/transcribe.js](server/src/transcribe.js), exports `transcribeFile`) which does not load `.env`.
-- [client/](client/) — Vite + React frontend. All UI logic is in [client/src/App.jsx](client/src/App.jsx): MediaRecorder captures mic audio in 250ms chunks, sends binary over WebSocket, renders interim results (italic/gray) and final lines separately. A "Listen" button posts the final transcript to `/api/tts` and plays the returned MP3.
+- [server/](server/) — Express + `ws` backend ([server/server.js](server/server.js)) with three surfaces:
+  - `/ws` — relay to Deepgram live transcription (`client.listen.v1.connect`, `nova-3`).
+  - `/ws-agent` — relay to the Deepgram Voice Agent API (`wss://agent.deepgram.com/v1/agent/converse`, via raw `ws`, NOT the SDK — the SDK's agent socket JSON-parses every frame and breaks on binary agent audio). Sends the `Settings` message (linear16 @ 24kHz both directions, nova-3 listen, `open_ai`/`gpt-4o-mini` think, `aura-2-thalia-en` speak, greeting) on open, then pipes binary audio and JSON events both ways.
+  - `POST /api/tts` — Deepgram Aura TTS (`client.speak.v1.audio.generate`) returning MP3; text is split into ≤1900-char sentence chunks and concatenated (Deepgram caps TTS at 2000 chars/request).
+
+  Serves the built React app from `client/dist` at http://localhost:3000 (port via `PORT`). Loads `server/.env` via `dotenv`. Also contains a separate batch transcription CLI ([server/src/transcribe.js](server/src/transcribe.js), exports `transcribeFile`) which does not load `.env`.
+- [client/](client/) — Vite + React frontend. [App.jsx](client/src/App.jsx) renders two tabs:
+  - [AgentPanel.jsx](client/src/AgentPanel.jsx) — conversational agent. ScriptProcessor captures mic as 16-bit PCM @ 24kHz (must match the server's agent `Settings` sample rates), agent audio chunks are scheduled gap-free via Web Audio `AudioBufferSource`s, `UserStartedSpeaking` triggers barge-in by stopping queued sources. Conversation log from `ConversationText` events.
+  - [TranscribePanel.jsx](client/src/TranscribePanel.jsx) — live transcription (MediaRecorder 250ms chunks over `/ws`, interim vs final via `message.is_final`) plus a "Listen" button that posts the transcript to `/api/tts` and plays the MP3.
+
 There is no linter or test suite.
 
 ## Commands
@@ -19,7 +27,7 @@ Requires Node ≥18 (machine default may be 14 via nvm4w — run `nvm use 22.17.
 cd server && npm install
 cd client && npm install
 
-# Development: backend on :3000, Vite dev server on :5173 proxying /ws to it
+# Development: backend on :3000, Vite dev server on :5173 proxying /ws, /ws-agent, /api to it
 cd server && npm start        # terminal 1
 cd client && npm run dev      # terminal 2 (HMR)
 
@@ -39,6 +47,6 @@ Do NOT use `npm --prefix <dir> install` from outside a package — it has errone
 
 ## Architecture notes
 
-- The backend queues incoming audio messages until the Deepgram connection opens, then flushes ([server/server.js:58](server/server.js#L58)).
-- The frontend distinguishes interim vs final transcripts via `message.is_final` on Deepgram `Results` messages; interim text is replaced in place, finals are appended.
-- The WebSocket URL `ws://<host>/ws` and `/api/*` work in both modes: Vite proxies them to :3000 (see [client/vite.config.js](client/vite.config.js)); in production the same origin serves both.
+- Both WebSocket servers use `noServer: true` with manual routing in a single `server.on("upgrade")` handler — two path-scoped `WebSocket.Server`s attached to one HTTP server each 400 the other's upgrade requests.
+- Relays queue browser messages until the upstream Deepgram connection opens, then flush.
+- End-to-end testing without a microphone: drive headless Chrome (puppeteer-core) with `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream --use-file-for-fake-audio-capture=<wav>` against a server on a spare port.
