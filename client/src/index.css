@@ -28,6 +28,63 @@ h1 {
   margin-top: 0.25rem;
 }
 
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.settings-btn {
+  background: #f0f0f0;
+  color: #333;
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.settings-btn:hover {
+  background: #e0e0e0;
+}
+
+.settings-panel {
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
+  padding: 1rem 1.25rem;
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.settings-label {
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #777;
+}
+
+.settings-panel label {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.interim-bubble {
+  opacity: 0.55;
+  font-style: italic;
+}
+
 .tabs {
   display: flex;
   gap: 0.5rem;

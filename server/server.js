@@ -29,8 +29,9 @@ server.on("upgrade", (request, socket, head) => {
 const apiKey = process.env.DEEPGRAM_API_KEY;
 
 if (!apiKey) {
-  console.error("Error: DEEPGRAM_API_KEY environment variable not set");
-  process.exit(1);
+  console.warn(
+    "Warning: DEEPGRAM_API_KEY not set — Deepgram mode (/ws, /ws-agent, /api/tts) is disabled. Browser (free) mode still works."
+  );
 }
 
 app.use(express.json());
@@ -55,6 +56,9 @@ function chunkText(text) {
 }
 
 app.post("/api/tts", async (req, res) => {
+  if (!apiKey) {
+    return res.status(400).json({ error: "DEEPGRAM_API_KEY not configured" });
+  }
   const text = (req.body?.text || "").trim();
   if (!text) {
     return res.status(400).json({ error: "No text provided" });
@@ -77,6 +81,143 @@ app.post("/api/tts", async (req, res) => {
   }
 });
 
+// Text chat endpoint for the free (browser speech) mode — no Deepgram involved.
+// The browser does STT/TTS itself and sends conversation text here; the reply
+// comes from Groq or Gemini with the same knowledge base + order lookup tools.
+const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GEMINI_MODEL = "gemini-2.5-flash";
+const MAX_TOOL_ROUNDS = 4;
+
+async function chatWithGroq(history) {
+  const messages = [
+    { role: "system", content: buildSupportPrompt() },
+    ...history,
+  ];
+  const tools = SUPPORT_FUNCTIONS.map((fn) => ({ type: "function", function: fn }));
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.5 }),
+    });
+    if (!response.ok) {
+      throw new Error(`Groq API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    }
+    const message = (await response.json()).choices?.[0]?.message;
+    if (!message) throw new Error("Groq returned no message");
+
+    if (message.tool_calls?.length) {
+      messages.push(message);
+      for (const call of message.tool_calls) {
+        const handler = FUNCTION_HANDLERS[call.function?.name];
+        let args = {};
+        try {
+          args = JSON.parse(call.function?.arguments || "{}");
+        } catch {
+          // leave args empty
+        }
+        const result = handler ? handler(args) : { error: `Unknown function: ${call.function?.name}` };
+        console.log(`Chat function call (groq): ${call.function?.name} →`, result);
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify(result),
+        });
+      }
+      continue;
+    }
+    return message.content || "";
+  }
+  throw new Error("Too many function-call rounds");
+}
+
+async function chatWithGemini(history) {
+  const contents = history.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": process.env.GEMINI_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: buildSupportPrompt() }] },
+          contents,
+          tools: [{ functionDeclarations: SUPPORT_FUNCTIONS }],
+        }),
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`Gemini API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    }
+    const candidate = (await response.json()).candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+    const functionCalls = parts.filter((p) => p.functionCall);
+
+    if (functionCalls.length > 0) {
+      contents.push(candidate.content);
+      contents.push({
+        role: "user",
+        parts: functionCalls.map((p) => {
+          const handler = FUNCTION_HANDLERS[p.functionCall.name];
+          const result = handler
+            ? handler(p.functionCall.args || {})
+            : { error: `Unknown function: ${p.functionCall.name}` };
+          console.log(`Chat function call (gemini): ${p.functionCall.name} →`, result);
+          return {
+            functionResponse: { name: p.functionCall.name, response: { result } },
+          };
+        }),
+      });
+      continue;
+    }
+    const text = parts.map((p) => p.text || "").join("").trim();
+    if (text) return text;
+    throw new Error(`Gemini returned no text (finishReason: ${candidate?.finishReason || "unknown"})`);
+  }
+  throw new Error("Too many function-call rounds");
+}
+
+app.post("/api/chat", async (req, res) => {
+  const { messages = [], provider } = req.body || {};
+
+  const available = {
+    groq: Boolean(process.env.GROQ_API_KEY),
+    gemini: Boolean(process.env.GEMINI_API_KEY),
+  };
+  const chosen = available[provider] ? provider : available.groq ? "groq" : available.gemini ? "gemini" : null;
+  if (!chosen) {
+    return res.status(400).json({
+      error: "No LLM API key configured. Add GROQ_API_KEY or GEMINI_API_KEY to server/.env and restart.",
+    });
+  }
+
+  const history = messages
+    .filter((m) => (m?.role === "user" || m?.role === "assistant") && typeof m?.content === "string")
+    .slice(-30);
+  if (history.length === 0 || history[history.length - 1].role !== "user") {
+    return res.status(400).json({ error: "messages must end with a user message" });
+  }
+
+  try {
+    const reply = await (chosen === "groq" ? chatWithGroq : chatWithGemini)(history);
+    res.json({ reply, provider: chosen });
+  } catch (error) {
+    console.error("Chat error:", error);
+    res.status(502).json({ error: error.message || "Chat request failed" });
+  }
+});
+
 // Serve the built React app (run `npm run build` in ../client first, or use
 // the Vite dev server on port 5173 which proxies /ws here).
 const clientDist = path.join(__dirname, "..", "client", "dist");
@@ -92,6 +233,12 @@ if (fs.existsSync(clientDist)) {
 
 wss.on("connection", async (ws) => {
   console.log("Client connected");
+
+  if (!apiKey) {
+    ws.send(JSON.stringify({ type: "error", message: "DEEPGRAM_API_KEY not configured" }));
+    ws.close();
+    return;
+  }
 
   let connection = null;
   let isConnected = false;
@@ -222,6 +369,36 @@ const FUNCTION_HANDLERS = {
   get_order_status: (args) => getOrderStatus(args.order_id),
 };
 
+const SUPPORT_FUNCTIONS = [
+  {
+    name: "get_order_status",
+    description:
+      "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
+    parameters: {
+      type: "object",
+      properties: {
+        order_id: {
+          type: "string",
+          description: "The customer's order number, e.g. 1001",
+        },
+      },
+      required: ["order_id"],
+    },
+  },
+];
+
+function buildSupportPrompt() {
+  return [
+    "You are a friendly customer support agent for the company described in the knowledge base below.",
+    "You are speaking with a customer over voice, so keep replies short, natural, and conversational — one or two sentences unless more detail is needed.",
+    "Answer ONLY from the knowledge base and the tools available to you. If the customer asks about an order, ask for their order number and use the get_order_status function.",
+    "If you don't know the answer or the request is outside your knowledge, say so and offer the support email instead of guessing.",
+    "",
+    "=== KNOWLEDGE BASE ===",
+    loadKnowledge(),
+  ].join("\n");
+}
+
 function buildAgentSettings() {
   return {
     type: "Settings",
@@ -233,32 +410,8 @@ function buildAgentSettings() {
       listen: { provider: { type: "deepgram", model: "nova-3" } },
       think: {
         provider: { type: "open_ai", model: "gpt-4o-mini", temperature: 0.5 },
-        prompt: [
-          "You are a friendly customer support agent for the company described in the knowledge base below.",
-          "You are speaking with a customer over voice, so keep replies short, natural, and conversational — one or two sentences unless more detail is needed.",
-          "Answer ONLY from the knowledge base and the tools available to you. If the customer asks about an order, ask for their order number and use the get_order_status function.",
-          "If you don't know the answer or the request is outside your knowledge, say so and offer the support email instead of guessing.",
-          "",
-          "=== KNOWLEDGE BASE ===",
-          loadKnowledge(),
-        ].join("\n"),
-        functions: [
-          {
-            name: "get_order_status",
-            description:
-              "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
-            parameters: {
-              type: "object",
-              properties: {
-                order_id: {
-                  type: "string",
-                  description: "The customer's order number, e.g. 1001",
-                },
-              },
-              required: ["order_id"],
-            },
-          },
-        ],
+        prompt: buildSupportPrompt(),
+        functions: SUPPORT_FUNCTIONS,
       },
       speak: { provider: { type: "deepgram", model: "aura-2-thalia-en" } },
       greeting: "Hi! Thanks for calling Acme Gadgets support. How can I help you today?",
@@ -296,6 +449,12 @@ function handleFunctionCallRequest(dgWs, message) {
 
 agentWss.on("connection", (browserWs) => {
   console.log("Agent client connected");
+
+  if (!apiKey) {
+    browserWs.send(JSON.stringify({ type: "Error", description: "DEEPGRAM_API_KEY not configured" }));
+    browserWs.close();
+    return;
+  }
 
   const dgWs = new WebSocket(AGENT_URL, {
     headers: { Authorization: `Token ${apiKey}` },
