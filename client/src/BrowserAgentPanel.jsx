@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSpeechRecognition, speechSupported, speak, stopSpeaking } from "./speech.js";
 
+import { getCustomerId, makeId } from "./identity.js";
+
 const GREETING = "Hi! Thanks for calling Acme Gadgets support. How can I help you today?";
 
 // Free-mode support agent: SpeechRecognition (browser STT) → /api/chat
@@ -152,6 +154,7 @@ export default function BrowserAgentPanel({ provider }) {
             messages: messagesRef.current,
             provider: providerRef.current,
             sessionId: sessionIdRef.current,
+            customerId: getCustomerId(),
           }),
         });
         const body = await response.json().catch(() => ({}));
@@ -173,10 +176,7 @@ export default function BrowserAgentPanel({ provider }) {
   const start = useCallback(() => {
     // New thread per call: the server keeps conversational memory (MongoDB
     // LangGraph checkpoints) keyed by this id.
-    sessionIdRef.current =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `s-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    sessionIdRef.current = makeId();
     messagesRef.current = [{ role: "assistant", content: GREETING }];
     setMessages(messagesRef.current);
     setStatus("active");

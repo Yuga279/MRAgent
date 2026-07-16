@@ -1,10 +1,8 @@
 // One-shot ingestion: chunk server/data/knowledge.md and upsert it into the
 // Pinecone index (created automatically if missing). Run after every edit to
 // knowledge.md:  cd server && npm run ingest-knowledge
-const path = require("path");
-require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-
-const { isPineconeConfigured, ingestKnowledge, INDEX_NAME } = require("../src/rag.js");
+// config.js loads server/.env itself.
+const { isPineconeConfigured, ingestKnowledge, INDEX_NAME } = require("../src/infra/rag.js");
 
 async function main() {
   if (!isPineconeConfigured()) {

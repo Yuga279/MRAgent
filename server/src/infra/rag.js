@@ -1,33 +1,33 @@
-// Pinecone-backed knowledge base retrieval. Uses Pinecone's integrated
-// embeddings (llama-text-embed-v2) so the only credential needed is
-// PINECONE_API_KEY — no separate embedding provider.
+// Pinecone-backed vector storage: the knowledge base ("knowledge" namespace)
+// and long-term conversational memory ("memory" namespace) live in the same
+// index. Uses Pinecone's integrated embeddings (llama-text-embed-v2) so the
+// only credential needed is PINECONE_API_KEY — no separate embedding provider.
 //
 // Ingest with `npm run ingest-knowledge` (chunks knowledge.md by ## section
-// and upserts). At runtime the agent calls search_knowledge, which queries
-// the index; when PINECONE_API_KEY is missing the app falls back to inlining
-// knowledge.md in the prompt as before.
+// and upserts). When PINECONE_API_KEY is missing every function degrades to a
+// "not configured" result.
 const fs = require("fs");
 const path = require("path");
+
+const config = require("../config.js");
 
 const PINECONE_API_VERSION = "2025-04";
 const EMBED_MODEL = "llama-text-embed-v2";
 const NAMESPACE = "knowledge";
-// Long-term conversational memory lives in its own namespace of the same
-// index: one record per completed exchange, searched semantically on every
-// new customer question (MongoDB checkpoints remain the short-term,
+// One record per completed exchange, searched semantically on every new
+// customer question (MongoDB checkpoints remain the short-term,
 // within-session memory).
 const MEMORY_NAMESPACE = "memory";
 
-const INDEX_NAME = process.env.PINECONE_INDEX || "mragent-knowledge";
-const DATA_DIR = process.env.MRAGENT_DATA_DIR || path.join(__dirname, "..", "data");
+const INDEX_NAME = config.pineconeIndex;
 
 function isPineconeConfigured() {
-  return Boolean(process.env.PINECONE_API_KEY);
+  return Boolean(config.pineconeApiKey);
 }
 
 function controlHeaders() {
   return {
-    "Api-Key": process.env.PINECONE_API_KEY,
+    "Api-Key": config.pineconeApiKey,
     "Content-Type": "application/json",
     "X-Pinecone-API-Version": PINECONE_API_VERSION,
   };
@@ -112,7 +112,7 @@ async function upsertRecords(namespace, records) {
   const res = await fetch(`https://${host}/records/namespaces/${namespace}/upsert`, {
     method: "POST",
     headers: {
-      "Api-Key": process.env.PINECONE_API_KEY,
+      "Api-Key": config.pineconeApiKey,
       "Content-Type": "application/x-ndjson",
       "X-Pinecone-API-Version": PINECONE_API_VERSION,
     },
@@ -129,7 +129,7 @@ async function searchRecords(namespace, query, topK, fields) {
   const res = await fetch(`https://${host}/records/namespaces/${namespace}/search`, {
     method: "POST",
     headers: {
-      "Api-Key": process.env.PINECONE_API_KEY,
+      "Api-Key": config.pineconeApiKey,
       "Content-Type": "application/json",
       "X-Pinecone-API-Version": PINECONE_API_VERSION,
     },
@@ -146,7 +146,7 @@ async function searchRecords(namespace, query, topK, fields) {
 
 // Chunk knowledge.md and upsert every chunk.
 async function ingestKnowledge() {
-  const markdown = fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
+  const markdown = fs.readFileSync(path.join(config.dataDir, "knowledge.md"), "utf8");
   const chunks = chunkKnowledge(markdown);
   if (chunks.length === 0) throw new Error("knowledge.md produced no chunks");
   await upsertRecords(
@@ -219,7 +219,6 @@ async function recallMemories(query, topK = 3) {
 module.exports = {
   isPineconeConfigured,
   chunkKnowledge,
-  ensureIndex,
   ingestKnowledge,
   searchKnowledge,
   saveMemory,

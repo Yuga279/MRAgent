@@ -2,7 +2,7 @@
   "name": "mragent-server",
   "version": "1.0.0",
   "private": true,
-  "description": "Node backend: relays browser mic audio to Deepgram live transcription",
+  "description": "Node backend: voice support agent (Deepgram relays, LangGraph chat agent, MongoDB orders/memory, Pinecone RAG)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

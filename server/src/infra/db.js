@@ -1,21 +1,22 @@
-// MongoDB access for orders, product catalog, and LangGraph conversational
-// memory. Configured via MONGODB_URI (+ optional MONGODB_DB, default
-// "mragent"); when unset, callers fall back to the JSON-file data in
-// server/data. The mongodb package is required lazily so the server still
-// boots without it when Mongo is not configured.
-const DB_NAME = process.env.MONGODB_DB || "mragent";
+// MongoDB access for orders, product catalog, customer profiles, and
+// LangGraph conversational memory. When MONGODB_URI is unset the getters
+// throw and callers degrade gracefully. The mongodb package is required
+// lazily so the server still boots without it when Mongo is not configured.
+const config = require("../config.js");
+
+const DB_NAME = config.mongoDbName;
 
 let clientPromise = null;
 
 function isMongoConfigured() {
-  return Boolean(process.env.MONGODB_URI);
+  return Boolean(config.mongoUri);
 }
 
 async function getClient() {
   if (!isMongoConfigured()) throw new Error("MONGODB_URI is not configured");
   if (!clientPromise) {
     const { MongoClient } = require("mongodb");
-    const client = new MongoClient(process.env.MONGODB_URI, {
+    const client = new MongoClient(config.mongoUri, {
       serverSelectionTimeoutMS: 5000,
     });
     clientPromise = client.connect();
@@ -35,12 +36,8 @@ async function getProductsCollection() {
   return (await getDb()).collection("products");
 }
 
-async function closeDb() {
-  if (clientPromise) {
-    const client = await clientPromise;
-    clientPromise = null;
-    await client.close();
-  }
+async function getCustomerMemoryCollection() {
+  return (await getDb()).collection("customer_memory");
 }
 
 module.exports = {
@@ -50,5 +47,5 @@ module.exports = {
   getDb,
   getOrdersCollection,
   getProductsCollection,
-  closeDb,
+  getCustomerMemoryCollection,
 };
