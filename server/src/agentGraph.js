@@ -12,6 +12,7 @@ const { z } = require("zod");
 
 const { FUNCTION_HANDLERS, buildSupportPrompt } = require("./support.js");
 const { isPineconeConfigured, searchKnowledge } = require("./rag.js");
+const { isMongoConfigured, getClient, DB_NAME } = require("./db.js");
 
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 const GEMINI_MODEL = "gemini-2.5-flash";
@@ -25,17 +26,31 @@ function buildTools(context) {
   const wrap = (result) => JSON.stringify(result);
 
   const tools = [
-    tool(async ({ order_id }) => wrap(FUNCTION_HANDLERS.get_order_status({ order_id }, context)), {
-      name: "get_order_status",
-      description:
-        "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
-      schema: z.object({
-        order_id: z.string().describe("The customer's order number, e.g. 1001"),
-      }),
-    }),
+    tool(
+      async ({ order_id }) => wrap(await FUNCTION_HANDLERS.get_order_status({ order_id }, context)),
+      {
+        name: "get_order_status",
+        description:
+          "Look up the current status of a customer's order (shipping status, tracking number, delivery estimate) by its order number.",
+        schema: z.object({
+          order_id: z.string().describe("The customer's order number, e.g. 1001"),
+        }),
+      }
+    ),
+    tool(
+      async ({ product }) => wrap(await FUNCTION_HANDLERS.get_product_details({ product }, context)),
+      {
+        name: "get_product_details",
+        description:
+          "Look up a catalog product's exact price and description by name. Use it to answer product questions and to verify the product name before placing an order.",
+        schema: z.object({
+          product: z.string().describe("Product name (or part of it), e.g. HomeCam 360"),
+        }),
+      }
+    ),
     tool(
       async ({ product, shipping, customer_confirmed }) =>
-        wrap(FUNCTION_HANDLERS.place_order({ product, shipping, customer_confirmed }, context)),
+        wrap(await FUNCTION_HANDLERS.place_order({ product, shipping, customer_confirmed }, context)),
       {
         name: "place_order",
         description:
@@ -85,7 +100,7 @@ function buildModel(provider) {
 // retrieval was tried first but Llama on Groq reliably garbles the
 // search_knowledge call, so the chat path injects context up front instead.
 async function retrieveKnowledge(question) {
-  if (!isPineconeConfigured()) return undefined; // prompt falls back to inline knowledge.md
+  if (!isPineconeConfigured()) return "(knowledge base not configured — say so and offer the support email)";
   try {
     const result = await searchKnowledge(question, 3);
     if (!result.found) return "(no relevant knowledge base entries found)";
@@ -96,31 +111,56 @@ async function retrieveKnowledge(question) {
   }
 }
 
+// Conversational memory: LangGraph checkpoints stored in MongoDB, keyed by
+// the browser session's thread_id. Lazily created so the server boots without
+// the mongodb packages when Mongo is not configured.
+let checkpointerPromise = null;
+
+function getCheckpointer() {
+  if (!checkpointerPromise) {
+    checkpointerPromise = (async () => {
+      const { MongoDBSaver } = require("@langchain/langgraph-checkpoint-mongodb");
+      return new MongoDBSaver({ client: await getClient(), dbName: DB_NAME });
+    })();
+  }
+  return checkpointerPromise;
+}
+
 // history: [{role: "user"|"assistant", content}], ending with a user message.
-// Returns the agent's final text reply.
-async function runSupportAgent(history, provider) {
+// Returns the agent's final text reply. With Mongo + a sessionId the graph
+// checkpointer holds the conversation (only the newest user message is fed
+// in); otherwise the client-sent history is replayed statelessly.
+async function runSupportAgent(history, provider, sessionId) {
   const lastUser = [...history].reverse().find((m) => m.role === "user");
   const context = { lastUserMessage: lastUser ? lastUser.content : "" };
+  const useMemory = Boolean(sessionId) && isMongoConfigured();
 
   const agent = createReactAgent({
     llm: buildModel(provider),
     tools: buildTools(context),
     prompt: buildSupportPrompt({ retrievedKnowledge: await retrieveKnowledge(context.lastUserMessage) }),
+    ...(useMemory ? { checkpointSaver: await getCheckpointer() } : {}),
   });
 
-  const messages = history.map((m) =>
-    m.role === "assistant" ? new AIMessage(m.content) : new HumanMessage(m.content)
-  );
+  const messages = useMemory
+    ? [new HumanMessage(context.lastUserMessage)]
+    : history.map((m) =>
+        m.role === "assistant" ? new AIMessage(m.content) : new HumanMessage(m.content)
+      );
+  const config = {
+    recursionLimit: RECURSION_LIMIT,
+    ...(useMemory ? { configurable: { thread_id: String(sessionId) } } : {}),
+  };
 
   // Llama on Groq occasionally writes the tool call as literal text instead
   // of a structured call; Groq rejects that with tool_use_failed. One retry
   // usually recovers.
   let result;
   try {
-    result = await agent.invoke({ messages }, { recursionLimit: RECURSION_LIMIT });
+    result = await agent.invoke({ messages }, config);
   } catch (error) {
     if (!/tool_use_failed/.test(error.message || "")) throw error;
-    result = await agent.invoke({ messages }, { recursionLimit: RECURSION_LIMIT });
+    result = await agent.invoke({ messages }, config);
   }
   const finalMessage = result.messages[result.messages.length - 1];
   const content = finalMessage?.content;

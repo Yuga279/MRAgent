@@ -1,35 +1,43 @@
 // Support-agent domain logic shared by the Deepgram voice agent relay and the
-// free-mode /api/chat endpoint: knowledge base, order lookup/placement with
-// consent guards, function schemas, and the system prompt.
-const fs = require("fs");
-const path = require("path");
+// free-mode /api/chat endpoint: order lookup/placement with consent guards,
+// product catalog, function schemas, and the system prompt. Orders and
+// products live in MongoDB; the knowledge base lives in Pinecone.
+const { searchKnowledge } = require("./rag.js");
+const { getOrdersCollection, getProductsCollection } = require("./db.js");
 
-const { isPineconeConfigured, searchKnowledge } = require("./rag.js");
-
-const DATA_DIR = process.env.MRAGENT_DATA_DIR || path.join(__dirname, "..", "data");
-
-function loadKnowledge() {
+async function getOrderStatus(orderId) {
+  const id = String(orderId).trim();
   try {
-    return fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function getOrderStatus(orderId) {
-  try {
-    const orders = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "orders.json"), "utf8"));
-    const order = orders.find((o) => String(o.order_id) === String(orderId).trim());
-    if (!order) {
-      return {
-        found: false,
-        message: `No order found with ID ${orderId}. Ask the customer to double-check the order number.`,
-      };
-    }
-    return { found: true, ...order };
+    const order = await (await getOrdersCollection()).findOne(
+      { order_id: id },
+      { projection: { _id: 0 } }
+    );
+    return order
+      ? { found: true, ...order }
+      : {
+          found: false,
+          message: `No order found with ID ${orderId}. Ask the customer to double-check the order number.`,
+        };
   } catch (error) {
     console.error("Order lookup error:", error);
     return { found: false, message: "The order system is temporarily unavailable." };
+  }
+}
+
+async function getProductDetails(productName) {
+  const name = String(productName || "").trim();
+  if (!name) return { found: false, message: "No product name given." };
+  try {
+    const product = await (await getProductsCollection()).findOne(
+      { name: { $regex: escapeRegex(name), $options: "i" } },
+      { projection: { _id: 0 } }
+    );
+    return product
+      ? { found: true, ...product }
+      : { found: false, message: `No product named "${name}" in the catalog.` };
+  } catch (error) {
+    console.error("Product lookup error:", error);
+    return { found: false, message: "The product catalog is temporarily unavailable." };
   }
 }
 
@@ -68,7 +76,7 @@ function looksLikePurchaseConsent(message, product) {
   return words.some((w) => new RegExp(`\\b${escapeRegex(w)}\\b`, "i").test(message));
 }
 
-function placeOrder(product, shipping, context = {}) {
+async function placeOrder(product, shipping, context = {}) {
   if (!product || typeof product !== "string") {
     return { success: false, message: "No product specified. Ask the customer which product they want." };
   }
@@ -91,43 +99,46 @@ function placeOrder(product, shipping, context = {}) {
     };
   }
 
-  try {
-    const ordersPath = path.join(DATA_DIR, "orders.json");
-    const orders = JSON.parse(fs.readFileSync(ordersPath, "utf8"));
-
-    // Gate 3: don't silently create back-to-back duplicates of the same product.
-    const duplicate = orders.find(
-      (o) =>
-        o.created_at &&
-        Date.now() - Date.parse(o.created_at) < DUPLICATE_ORDER_WINDOW_MS &&
-        (o.items || []).join() === product
-    );
-    if (duplicate) {
-      return {
-        success: false,
-        duplicate: true,
-        order_id: duplicate.order_id,
-        message: `Order NOT placed — order ${duplicate.order_id} for the same product was created moments ago. Tell the customer their existing order number ${duplicate.order_id}; if they want an additional unit, apologize and ask them to order it again in a few minutes or via the support email.`,
-      };
-    }
-
-    const nextId = String(
-      orders.reduce((max, o) => Math.max(max, Number(o.order_id) || 0), 1000) + 1
-    );
+  const duplicateResult = (existing) => ({
+    success: false,
+    duplicate: true,
+    order_id: existing.order_id,
+    message: `Order NOT placed — order ${existing.order_id} for the same product was created moments ago. Tell the customer their existing order number ${existing.order_id}; if they want an additional unit, apologize and ask them to order it again in a few minutes or via the support email.`,
+  });
+  const buildOrder = (nextId) => {
     const shipDays = shipping === "express" ? 1 : 3;
-    const shipDate = new Date(Date.now() + shipDays * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .slice(0, 10);
-    const order = {
+    return {
       order_id: nextId,
       status: "processing",
       items: [product],
       shipping: shipping === "express" ? "express" : "standard",
-      estimated_ship_date: shipDate,
+      estimated_ship_date: new Date(Date.now() + shipDays * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10),
       created_at: new Date().toISOString(),
     };
-    orders.push(order);
-    fs.writeFileSync(ordersPath, JSON.stringify(orders, null, 2) + "\n");
+  };
+
+  try {
+    const collection = await getOrdersCollection();
+
+    // Gate 3: don't silently create back-to-back duplicates of the same product.
+    const cutoff = new Date(Date.now() - DUPLICATE_ORDER_WINDOW_MS).toISOString();
+    const duplicate = await collection.findOne({
+      created_at: { $gt: cutoff },
+      items: [product],
+    });
+    if (duplicate) return duplicateResult(duplicate);
+
+    const [top] = await collection
+      .aggregate([
+        { $addFields: { idNum: { $convert: { input: "$order_id", to: "int", onError: 0 } } } },
+        { $sort: { idNum: -1 } },
+        { $limit: 1 },
+      ])
+      .toArray();
+    const order = buildOrder(String(Math.max(top?.idNum || 0, 1000) + 1));
+    await collection.insertOne({ ...order });
     return { success: true, ...order };
   } catch (error) {
     console.error("Place order error:", error);
@@ -147,6 +158,7 @@ const FUNCTION_HANDLERS = {
     }
   },
   get_order_status: (args) => getOrderStatus(args.order_id),
+  get_product_details: (args) => getProductDetails(args.product),
   place_order: (args, context = {}) =>
     placeOrder(args.product, args.shipping, {
       confirmed: args.customer_confirmed === true,
@@ -171,7 +183,7 @@ const SEARCH_KNOWLEDGE_FUNCTION = {
 };
 
 const SUPPORT_FUNCTIONS = [
-  ...(isPineconeConfigured() ? [SEARCH_KNOWLEDGE_FUNCTION] : []),
+  SEARCH_KNOWLEDGE_FUNCTION,
   {
     name: "get_order_status",
     description:
@@ -185,6 +197,21 @@ const SUPPORT_FUNCTIONS = [
         },
       },
       required: ["order_id"],
+    },
+  },
+  {
+    name: "get_product_details",
+    description:
+      "Look up a catalog product's exact price and description by name. Use it to answer product questions and to verify the product name before placing an order.",
+    parameters: {
+      type: "object",
+      properties: {
+        product: {
+          type: "string",
+          description: "Product name (or part of it), e.g. HomeCam 360",
+        },
+      },
+      required: ["product"],
     },
   },
   {
@@ -214,23 +241,21 @@ const SUPPORT_FUNCTIONS = [
   },
 ];
 
-// Knowledge can reach the model three ways:
+// Knowledge (Pinecone) reaches the model two ways:
 //  - retrievedKnowledge given → RAG: the caller already queried Pinecone with
 //    the customer's question; the top chunks are inlined (used by /api/chat).
-//  - Pinecone configured, no retrievedKnowledge → the search_knowledge
-//    function does retrieval per question (used by the Deepgram agent, whose
-//    prompt is fixed once at session start).
-//  - Pinecone not configured → all of knowledge.md is inlined (legacy).
+//  - no retrievedKnowledge → the search_knowledge function does retrieval per
+//    question (used by the Deepgram agent, whose prompt is fixed once at
+//    session start).
 function buildSupportPrompt({ retrievedKnowledge } = {}) {
-  const mode = retrievedKnowledge != null ? "retrieved" : isPineconeConfigured() ? "tool" : "inline";
-  const knowledgeRule =
-    mode === "tool"
-      ? "3. Answer ONLY from search_knowledge results and your other functions. For ANY question about products, prices, shipping, returns, warranty, or company info, call search_knowledge first. If it returns nothing, say you don't know in one sentence and offer the support email."
-      : "3. Answer ONLY from the knowledge base and your functions. If you don't know, say so in one sentence and offer the support email.";
+  const retrieved = retrievedKnowledge != null;
+  const knowledgeRule = retrieved
+    ? "3. Answer ONLY from the knowledge base, this conversation, and your functions. If you don't know, say so in one sentence and offer the support email."
+    : "3. Answer ONLY from search_knowledge results, this conversation, and your other functions. For ANY question about products, prices, shipping, returns, warranty, or company info, call search_knowledge first. If it returns nothing, say you don't know in one sentence and offer the support email.";
   return [
-    mode === "tool"
-      ? "You are a friendly customer support agent for Acme Gadgets, speaking with a customer over the phone. Company information comes from the search_knowledge function."
-      : "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone.",
+    retrieved
+      ? "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone."
+      : "You are a friendly customer support agent for Acme Gadgets, speaking with a customer over the phone. Company information comes from the search_knowledge function.",
     "RULES — follow every one:",
     "1. Reply in ONE short sentence of plain spoken English, 20 words or fewer. Never use lists, headings, or long explanations.",
     "2. Give only what was asked. The customer will follow up if they want more.",
@@ -242,11 +267,9 @@ function buildSupportPrompt({ retrievedKnowledge } = {}) {
     // syntax" taught Llama to emit literal <function=...> text, which Groq
     // rejects with tool_use_failed.
     "7. Never mention functions, tools, or JSON to the customer. Use the tools API to call functions; your text reply must contain only plain spoken English.",
-    ...(mode === "retrieved"
+    ...(retrieved
       ? ["", "=== KNOWLEDGE BASE (most relevant entries for this customer's question) ===", retrievedKnowledge]
-      : mode === "inline"
-        ? ["", "=== KNOWLEDGE BASE ===", loadKnowledge()]
-        : []),
+      : []),
   ].join("\n");
 }
 
@@ -262,9 +285,8 @@ function sanitizeReply(text) {
 }
 
 module.exports = {
-  DATA_DIR,
-  loadKnowledge,
   getOrderStatus,
+  getProductDetails,
   placeOrder,
   looksLikePurchaseConsent,
   FUNCTION_HANDLERS,

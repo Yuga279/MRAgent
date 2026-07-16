@@ -18,6 +18,7 @@ export default function BrowserAgentPanel({ provider }) {
   const busyRef = useRef(false); // true while thinking or speaking
   const messagesRef = useRef([]);
   const providerRef = useRef(provider);
+  const sessionIdRef = useRef(null);
   const chatEndRef = useRef(null);
 
   providerRef.current = provider;
@@ -147,7 +148,11 @@ export default function BrowserAgentPanel({ provider }) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: messagesRef.current, provider: providerRef.current }),
+          body: JSON.stringify({
+            messages: messagesRef.current,
+            provider: providerRef.current,
+            sessionId: sessionIdRef.current,
+          }),
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -166,6 +171,12 @@ export default function BrowserAgentPanel({ provider }) {
   );
 
   const start = useCallback(() => {
+    // New thread per call: the server keeps conversational memory (MongoDB
+    // LangGraph checkpoints) keyed by this id.
+    sessionIdRef.current =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `s-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
     messagesRef.current = [{ role: "assistant", content: GREETING }];
     setMessages(messagesRef.current);
     setStatus("active");

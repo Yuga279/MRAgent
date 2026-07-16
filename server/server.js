@@ -97,7 +97,7 @@ app.post("/api/tts", async (req, res) => {
 const { runSupportAgent } = require("./src/agentGraph.js");
 
 app.post("/api/chat", async (req, res) => {
-  const { messages = [], provider } = req.body || {};
+  const { messages = [], provider, sessionId } = req.body || {};
 
   const available = {
     groq: Boolean(process.env.GROQ_API_KEY),
@@ -118,7 +118,7 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
-    const reply = sanitizeReply(await runSupportAgent(history, chosen));
+    const reply = sanitizeReply(await runSupportAgent(history, chosen, sessionId));
     if (!reply) throw new Error("The model returned an empty reply");
     res.json({ reply, provider: chosen });
   } catch (error) {
