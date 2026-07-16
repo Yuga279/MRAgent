@@ -12,6 +12,7 @@ const { isMongoConfigured, getClient, DB_NAME } = require("../infra/db.js");
 const { buildChatModel, contentToText } = require("../llm/providers.js");
 const { buildTools } = require("./tools.js");
 const { getCustomerFacts, updateCustomerFacts } = require("./memory.js");
+const { hasVerifiableKnowledge, verifyReply, correctReply } = require("./verify.js");
 
 // Each ReAct step is 2 graph transitions (agent → tools); 10 allows ~4 tool
 // rounds before the graph aborts.
@@ -109,7 +110,25 @@ async function runSupportAgent(history, provider, sessionId, customerId) {
     result = await agent.invoke({ messages }, config_);
   }
   const finalMessage = result.messages[result.messages.length - 1];
-  const reply = contentToText(finalMessage?.content).trim();
+  let reply = contentToText(finalMessage?.content).trim();
+
+  // Self-reflection guard: fact-check the draft against the retrieved
+  // knowledge and allow ONE correction round. Only when real knowledge was
+  // retrieved (nothing to verify against otherwise), and never blocking on
+  // verifier failure — verify.js fails open.
+  if (reply && hasVerifiableKnowledge(retrievedKnowledge)) {
+    const verdict = await verifyReply({ reply, retrievedKnowledge, provider });
+    if (!verdict.supported) {
+      console.log(`Reply failed fact-check (${verdict.issues}) — regenerating`);
+      reply = await correctReply({
+        draft: reply,
+        issues: verdict.issues,
+        systemPrompt,
+        lastUserMessage: context.lastUserMessage,
+        provider,
+      });
+    }
+  }
 
   // Persist the exchange to long-term memory (fire-and-forget — never delay
   // or fail the reply over it). "I don't know"-style replies are skipped:
