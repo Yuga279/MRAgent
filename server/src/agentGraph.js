@@ -11,7 +11,7 @@ const { HumanMessage, AIMessage } = require("@langchain/core/messages");
 const { z } = require("zod");
 
 const { FUNCTION_HANDLERS, buildSupportPrompt } = require("./support.js");
-const { isPineconeConfigured, searchKnowledge } = require("./rag.js");
+const { isPineconeConfigured, searchKnowledge, saveMemory, recallMemories } = require("./rag.js");
 const { isMongoConfigured, getClient, DB_NAME } = require("./db.js");
 
 const GROQ_MODEL = "llama-3.3-70b-versatile";
@@ -130,15 +130,38 @@ function getCheckpointer() {
 // Returns the agent's final text reply. With Mongo + a sessionId the graph
 // checkpointer holds the conversation (only the newest user message is fed
 // in); otherwise the client-sent history is replayed statelessly.
+// Long-term memory recall: fetch past exchanges (any session) relevant to
+// the question from the Pinecone memory namespace, formatted for the prompt.
+async function recallPastConversations(question) {
+  try {
+    const memories = await recallMemories(question, 3);
+    if (memories.length === 0) return undefined;
+    console.log(`Long-term memory: recalled ${memories.length} exchange(s) for "${question}"`);
+    return memories.map((m) => `[${m.savedAt || "earlier"}]\n${m.text}`).join("\n\n");
+  } catch (error) {
+    console.error("Memory recall error:", error);
+    return undefined;
+  }
+}
+
 async function runSupportAgent(history, provider, sessionId) {
   const lastUser = [...history].reverse().find((m) => m.role === "user");
   const context = { lastUserMessage: lastUser ? lastUser.content : "" };
   const useMemory = Boolean(sessionId) && isMongoConfigured();
 
+  const [retrievedKnowledge, pastMemories] = await Promise.all([
+    retrieveKnowledge(context.lastUserMessage),
+    recallPastConversations(context.lastUserMessage),
+  ]);
+
+  const systemPrompt = buildSupportPrompt({ retrievedKnowledge, pastMemories });
+  if (process.env.DEBUG_PROMPT) {
+    console.log("=== SYSTEM PROMPT ===\n" + systemPrompt + "\n=== END PROMPT ===");
+  }
   const agent = createReactAgent({
     llm: buildModel(provider),
     tools: buildTools(context),
-    prompt: buildSupportPrompt({ retrievedKnowledge: await retrieveKnowledge(context.lastUserMessage) }),
+    prompt: systemPrompt,
     ...(useMemory ? { checkpointSaver: await getCheckpointer() } : {}),
   });
 
@@ -164,12 +187,25 @@ async function runSupportAgent(history, provider, sessionId) {
   }
   const finalMessage = result.messages[result.messages.length - 1];
   const content = finalMessage?.content;
-  if (typeof content === "string") return content;
   // Content blocks (some providers return an array of parts).
-  if (Array.isArray(content)) {
-    return content.map((p) => (typeof p === "string" ? p : p.text || "")).join("").trim();
+  const reply =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content.map((p) => (typeof p === "string" ? p : p.text || "")).join("").trim()
+        : "";
+
+  // Persist the exchange to long-term memory (fire-and-forget — never delay
+  // or fail the reply over it). "I don't know"-style replies are skipped:
+  // saved failures outscore useful memories on similar questions and teach
+  // the model to keep failing.
+  const unhelpful = /i don'?t know|support@|email support|please repeat|didn'?t (catch|understand)/i;
+  if (reply && !unhelpful.test(reply)) {
+    saveMemory({ sessionId, userMessage: context.lastUserMessage, agentReply: reply }).catch(
+      (error) => console.error("Memory save error:", error)
+    );
   }
-  return "";
+  return reply;
 }
 
 module.exports = { runSupportAgent, buildTools, GROQ_MODEL, GEMINI_MODEL };

@@ -247,11 +247,13 @@ const SUPPORT_FUNCTIONS = [
 //  - no retrievedKnowledge → the search_knowledge function does retrieval per
 //    question (used by the Deepgram agent, whose prompt is fixed once at
 //    session start).
-function buildSupportPrompt({ retrievedKnowledge } = {}) {
+// pastMemories: relevant exchanges from previous calls, recalled from the
+// Pinecone memory namespace (long-term memory across sessions).
+function buildSupportPrompt({ retrievedKnowledge, pastMemories } = {}) {
   const retrieved = retrievedKnowledge != null;
   const knowledgeRule = retrieved
-    ? "3. Answer ONLY from the knowledge base, this conversation, and your functions. If you don't know, say so in one sentence and offer the support email."
-    : "3. Answer ONLY from search_knowledge results, this conversation, and your other functions. For ANY question about products, prices, shipping, returns, warranty, or company info, call search_knowledge first. If it returns nothing, say you don't know in one sentence and offer the support email.";
+    ? "3. Answer ONLY from the knowledge base, this conversation, the past conversations section (if present), and your functions. If you don't know, say so in one sentence and offer the support email."
+    : "3. Answer ONLY from search_knowledge results, this conversation, the past conversations section (if present), and your other functions. For ANY question about products, prices, shipping, returns, warranty, or company info, call search_knowledge first. If it returns nothing, say you don't know in one sentence and offer the support email.";
   return [
     retrieved
       ? "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone."
@@ -269,6 +271,14 @@ function buildSupportPrompt({ retrievedKnowledge } = {}) {
     "7. Never mention functions, tools, or JSON to the customer. Use the tools API to call functions; your text reply must contain only plain spoken English.",
     ...(retrieved
       ? ["", "=== KNOWLEDGE BASE (most relevant entries for this customer's question) ===", retrievedKnowledge]
+      : []),
+    ...(pastMemories
+      ? [
+          "",
+          "=== PAST CONVERSATIONS (your own memory of this customer's earlier calls) ===",
+          "You DO have this information — if the answer is below, give it directly instead of saying you don't know. Never invent details beyond what is written here.",
+          pastMemories,
+        ]
       : []),
   ].join("\n");
 }

@@ -12,6 +12,11 @@ const path = require("path");
 const PINECONE_API_VERSION = "2025-04";
 const EMBED_MODEL = "llama-text-embed-v2";
 const NAMESPACE = "knowledge";
+// Long-term conversational memory lives in its own namespace of the same
+// index: one record per completed exchange, searched semantically on every
+// new customer question (MongoDB checkpoints remain the short-term,
+// within-session memory).
+const MEMORY_NAMESPACE = "memory";
 
 const INDEX_NAME = process.env.PINECONE_INDEX || "mragent-knowledge";
 const DATA_DIR = process.env.MRAGENT_DATA_DIR || path.join(__dirname, "..", "data");
@@ -101,41 +106,27 @@ async function ensureIndex() {
   throw new Error(`Pinecone index ${INDEX_NAME} did not become ready in time`);
 }
 
-// Chunk knowledge.md and upsert every chunk (Pinecone embeds server-side).
-async function ingestKnowledge() {
-  const markdown = fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
-  const chunks = chunkKnowledge(markdown);
-  if (chunks.length === 0) throw new Error("knowledge.md produced no chunks");
-
+// Data-plane helpers (Pinecone embeds `chunk_text` server-side).
+async function upsertRecords(namespace, records) {
   const host = await ensureIndex();
-  const ndjson = chunks
-    .map((c, i) => JSON.stringify({ _id: `kb-${i}`, chunk_text: c.text, section: c.section }))
-    .join("\n");
-  const res = await fetch(`https://${host}/records/namespaces/${NAMESPACE}/upsert`, {
+  const res = await fetch(`https://${host}/records/namespaces/${namespace}/upsert`, {
     method: "POST",
     headers: {
       "Api-Key": process.env.PINECONE_API_KEY,
       "Content-Type": "application/x-ndjson",
       "X-Pinecone-API-Version": PINECONE_API_VERSION,
     },
-    body: ndjson,
+    body: records.map((r) => JSON.stringify(r)).join("\n"),
   });
   if (!res.ok) {
     throw new Error(`Pinecone upsert failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
   }
-  return chunks;
 }
 
-// Semantic search over the knowledge base; returns the matching chunk texts.
-async function searchKnowledge(query, topK = 4) {
-  if (!isPineconeConfigured()) {
-    return { found: false, message: "Knowledge search is not configured." };
-  }
+async function searchRecords(namespace, query, topK, fields) {
   const host = await getIndexHost();
-  if (!host) {
-    return { found: false, message: "Knowledge index does not exist yet. Run `npm run ingest-knowledge`." };
-  }
-  const res = await fetch(`https://${host}/records/namespaces/${NAMESPACE}/search`, {
+  if (!host) return null; // index not created yet
+  const res = await fetch(`https://${host}/records/namespaces/${namespace}/search`, {
     method: "POST",
     headers: {
       "Api-Key": process.env.PINECONE_API_KEY,
@@ -144,13 +135,36 @@ async function searchKnowledge(query, topK = 4) {
     },
     body: JSON.stringify({
       query: { inputs: { text: String(query || "") }, top_k: topK },
-      fields: ["chunk_text", "section"],
+      fields,
     }),
   });
   if (!res.ok) {
     throw new Error(`Pinecone search failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
   }
-  const hits = (await res.json()).result?.hits || [];
+  return (await res.json()).result?.hits || [];
+}
+
+// Chunk knowledge.md and upsert every chunk.
+async function ingestKnowledge() {
+  const markdown = fs.readFileSync(path.join(DATA_DIR, "knowledge.md"), "utf8");
+  const chunks = chunkKnowledge(markdown);
+  if (chunks.length === 0) throw new Error("knowledge.md produced no chunks");
+  await upsertRecords(
+    NAMESPACE,
+    chunks.map((c, i) => ({ _id: `kb-${i}`, chunk_text: c.text, section: c.section }))
+  );
+  return chunks;
+}
+
+// Semantic search over the knowledge base; returns the matching chunk texts.
+async function searchKnowledge(query, topK = 4) {
+  if (!isPineconeConfigured()) {
+    return { found: false, message: "Knowledge search is not configured." };
+  }
+  const hits = await searchRecords(NAMESPACE, query, topK, ["chunk_text", "section"]);
+  if (hits === null) {
+    return { found: false, message: "Knowledge index does not exist yet. Run `npm run ingest-knowledge`." };
+  }
   if (hits.length === 0) {
     return { found: false, message: "No matching knowledge base entries." };
   }
@@ -164,11 +178,51 @@ async function searchKnowledge(query, topK = 4) {
   };
 }
 
+// --- Long-term conversational memory ---
+
+// Persist one completed exchange. The id is derived from session + timestamp
+// so re-upserts are idempotent per turn.
+async function saveMemory({ sessionId, userMessage, agentReply }) {
+  if (!isPineconeConfigured()) return;
+  const text = `Customer: ${userMessage}\nAgent: ${agentReply}`;
+  await upsertRecords(MEMORY_NAMESPACE, [
+    {
+      _id: `mem-${sessionId}-${Date.now()}`,
+      chunk_text: text,
+      session_id: String(sessionId || "anonymous"),
+      saved_at: new Date().toISOString(),
+    },
+  ]);
+}
+
+// Recall past exchanges (across all sessions) relevant to the new question.
+// MIN_SCORE filters out weak matches so unrelated chatter isn't injected.
+const MEMORY_MIN_SCORE = 0.25;
+
+async function recallMemories(query, topK = 3) {
+  if (!isPineconeConfigured()) return [];
+  const hits = (await searchRecords(MEMORY_NAMESPACE, query, topK, [
+    "chunk_text",
+    "session_id",
+    "saved_at",
+  ])) || [];
+  return hits
+    .filter((h) => (h._score ?? 0) >= MEMORY_MIN_SCORE)
+    .map((h) => ({
+      text: h.fields?.chunk_text,
+      sessionId: h.fields?.session_id,
+      savedAt: h.fields?.saved_at,
+      score: h._score,
+    }));
+}
+
 module.exports = {
   isPineconeConfigured,
   chunkKnowledge,
   ensureIndex,
   ingestKnowledge,
   searchKnowledge,
+  saveMemory,
+  recallMemories,
   INDEX_NAME,
 };
