@@ -92,128 +92,9 @@ app.post("/api/tts", async (req, res) => {
 
 // Text chat endpoint for the free (browser speech) mode — no Deepgram involved.
 // The browser does STT/TTS itself and sends conversation text here; the reply
-// comes from Groq or Gemini with the same knowledge base + order lookup tools.
-const GROQ_MODEL = "llama-3.3-70b-versatile";
-const GEMINI_MODEL = "gemini-2.5-flash";
-const MAX_TOOL_ROUNDS = 4;
-
-function lastUserContent(history) {
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].role === "user") return history[i].content;
-  }
-  return "";
-}
-
-async function chatWithGroq(history) {
-  const messages = [
-    { role: "system", content: buildSupportPrompt() },
-    ...history,
-  ];
-  const context = { lastUserMessage: lastUserContent(history) };
-  const tools = SUPPORT_FUNCTIONS.map((fn) => ({ type: "function", function: fn }));
-
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: GROQ_MODEL, messages, tools, temperature: 0.3, max_tokens: 100 }),
-    });
-    if (!response.ok) {
-      throw new Error(`Groq API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
-    }
-    const message = (await response.json()).choices?.[0]?.message;
-    if (!message) throw new Error("Groq returned no message");
-
-    if (message.tool_calls?.length) {
-      messages.push(message);
-      for (const call of message.tool_calls) {
-        const handler = FUNCTION_HANDLERS[call.function?.name];
-        let args = {};
-        try {
-          args = JSON.parse(call.function?.arguments || "{}");
-        } catch {
-          // leave args empty
-        }
-        const result = handler ? handler(args, context) : { error: `Unknown function: ${call.function?.name}` };
-        console.log(`Chat function call (groq): ${call.function?.name} →`, result);
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: JSON.stringify(result),
-        });
-      }
-      continue;
-    }
-    return message.content || "";
-  }
-  throw new Error("Too many function-call rounds");
-}
-
-async function chatWithGemini(history) {
-  const context = { lastUserMessage: lastUserContent(history) };
-  const contents = history.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-
-  let retriedMalformed = false;
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "x-goog-api-key": process.env.GEMINI_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: buildSupportPrompt() }] },
-          contents,
-          tools: [{ functionDeclarations: SUPPORT_FUNCTIONS }],
-          // thinkingBudget 0 disables 2.5-flash "thinking", which otherwise
-          // consumes the output budget and truncates short replies.
-          generationConfig: { maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } },
-        }),
-      }
-    );
-    if (!response.ok) {
-      throw new Error(`Gemini API error ${response.status}: ${(await response.text()).slice(0, 300)}`);
-    }
-    const candidate = (await response.json()).candidates?.[0];
-    if (candidate?.finishReason === "MALFORMED_FUNCTION_CALL" && !retriedMalformed) {
-      retriedMalformed = true;
-      round--;
-      continue;
-    }
-    const parts = candidate?.content?.parts || [];
-    const functionCalls = parts.filter((p) => p.functionCall);
-
-    if (functionCalls.length > 0) {
-      contents.push(candidate.content);
-      contents.push({
-        role: "user",
-        parts: functionCalls.map((p) => {
-          const handler = FUNCTION_HANDLERS[p.functionCall.name];
-          const result = handler
-            ? handler(p.functionCall.args || {}, context)
-            : { error: `Unknown function: ${p.functionCall.name}` };
-          console.log(`Chat function call (gemini): ${p.functionCall.name} →`, result);
-          return {
-            functionResponse: { name: p.functionCall.name, response: { result } },
-          };
-        }),
-      });
-      continue;
-    }
-    const text = parts.map((p) => p.text || "").join("").trim();
-    if (text) return text;
-    throw new Error(`Gemini returned no text (finishReason: ${candidate?.finishReason || "unknown"})`);
-  }
-  throw new Error("Too many function-call rounds");
-}
+// comes from a LangGraph ReAct agent (src/agentGraph.js) running on Groq or
+// Gemini with the same knowledge base + order tools.
+const { runSupportAgent } = require("./src/agentGraph.js");
 
 app.post("/api/chat", async (req, res) => {
   const { messages = [], provider } = req.body || {};
@@ -237,7 +118,7 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
-    const reply = sanitizeReply(await (chosen === "groq" ? chatWithGroq : chatWithGemini)(history));
+    const reply = sanitizeReply(await runSupportAgent(history, chosen));
     if (!reply) throw new Error("The model returned an empty reply");
     res.json({ reply, provider: chosen });
   } catch (error) {
@@ -387,7 +268,7 @@ function buildAgentSettings() {
   };
 }
 
-function handleFunctionCallRequest(dgWs, message, context = {}) {
+async function handleFunctionCallRequest(dgWs, message, context = {}) {
   for (const call of message.functions || []) {
     if (!call.client_side) continue;
     const handler = FUNCTION_HANDLERS[call.name];
@@ -401,7 +282,12 @@ function handleFunctionCallRequest(dgWs, message, context = {}) {
       } catch {
         // leave args empty
       }
-      result = handler(args, context);
+      try {
+        result = await handler(args, context);
+      } catch (error) {
+        console.error(`Function ${call.name} failed:`, error);
+        result = { error: "Function temporarily unavailable." };
+      }
     }
     console.log(`Function call: ${call.name}(${call.arguments}) →`, result);
     dgWs.send(
@@ -449,7 +335,9 @@ agentWss.on("connection", (browserWs) => {
           conversationContext.lastUserMessage = message.content || "";
         }
         if (message.type === "FunctionCallRequest") {
-          handleFunctionCallRequest(dgWs, message, conversationContext);
+          handleFunctionCallRequest(dgWs, message, conversationContext).catch((error) =>
+            console.error("FunctionCallRequest handling failed:", error)
+          );
         }
       } catch {
         // forward unparseable text frames as-is

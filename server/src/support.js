@@ -4,6 +4,8 @@
 const fs = require("fs");
 const path = require("path");
 
+const { isPineconeConfigured, searchKnowledge } = require("./rag.js");
+
 const DATA_DIR = process.env.MRAGENT_DATA_DIR || path.join(__dirname, "..", "data");
 
 function loadKnowledge() {
@@ -136,6 +138,14 @@ function placeOrder(product, shipping, context = {}) {
 // Handlers receive (args, context) where context.lastUserMessage is the
 // customer's most recent utterance — used for server-side consent checks.
 const FUNCTION_HANDLERS = {
+  search_knowledge: async (args) => {
+    try {
+      return await searchKnowledge(args.query);
+    } catch (error) {
+      console.error("Knowledge search error:", error);
+      return { found: false, message: "The knowledge base is temporarily unavailable." };
+    }
+  },
   get_order_status: (args) => getOrderStatus(args.order_id),
   place_order: (args, context = {}) =>
     placeOrder(args.product, args.shipping, {
@@ -144,7 +154,24 @@ const FUNCTION_HANDLERS = {
     }),
 };
 
+const SEARCH_KNOWLEDGE_FUNCTION = {
+  name: "search_knowledge",
+  description:
+    "Search the company knowledge base (shipping, returns, warranty, products, prices, hours, contact info). Call this BEFORE answering any question about company policies or products.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "What to look up, e.g. 'express shipping cost' or 'HomeCam 360 price'",
+      },
+    },
+    required: ["query"],
+  },
+};
+
 const SUPPORT_FUNCTIONS = [
+  ...(isPineconeConfigured() ? [SEARCH_KNOWLEDGE_FUNCTION] : []),
   {
     name: "get_order_status",
     description:
@@ -187,20 +214,39 @@ const SUPPORT_FUNCTIONS = [
   },
 ];
 
-function buildSupportPrompt() {
+// Knowledge can reach the model three ways:
+//  - retrievedKnowledge given → RAG: the caller already queried Pinecone with
+//    the customer's question; the top chunks are inlined (used by /api/chat).
+//  - Pinecone configured, no retrievedKnowledge → the search_knowledge
+//    function does retrieval per question (used by the Deepgram agent, whose
+//    prompt is fixed once at session start).
+//  - Pinecone not configured → all of knowledge.md is inlined (legacy).
+function buildSupportPrompt({ retrievedKnowledge } = {}) {
+  const mode = retrievedKnowledge != null ? "retrieved" : isPineconeConfigured() ? "tool" : "inline";
+  const knowledgeRule =
+    mode === "tool"
+      ? "3. Answer ONLY from search_knowledge results and your other functions. For ANY question about products, prices, shipping, returns, warranty, or company info, call search_knowledge first. If it returns nothing, say you don't know in one sentence and offer the support email."
+      : "3. Answer ONLY from the knowledge base and your functions. If you don't know, say so in one sentence and offer the support email.";
   return [
-    "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone.",
+    mode === "tool"
+      ? "You are a friendly customer support agent for Acme Gadgets, speaking with a customer over the phone. Company information comes from the search_knowledge function."
+      : "You are a friendly customer support agent for the company described in the knowledge base below, speaking with a customer over the phone.",
     "RULES — follow every one:",
     "1. Reply in ONE short sentence of plain spoken English, 20 words or fewer. Never use lists, headings, or long explanations.",
     "2. Give only what was asked. The customer will follow up if they want more.",
-    "3. Answer ONLY from the knowledge base and your functions. If you don't know, say so in one sentence and offer the support email.",
+    knowledgeRule,
     "4. For order status questions, ask for the order number and use get_order_status.",
     "5. Ordering protocol, in strict sequence: (a) the customer names a product, (b) you ask them to confirm that product and choose standard or express shipping, (c) ONLY when their next message clearly says yes do you call place_order — then tell them just the order number and ship date. Never invent order numbers or tracking details, and never place the same order twice.",
     "6. This is a voice call, so messages may arrive garbled or cut off (e.g. 'response', 'don't you have'). If a message is unclear or doesn't make sense, ask the customer to repeat it — NEVER call a function or take an action based on an unclear message.",
-    "7. Never mention functions, tools, or JSON, and never write function-call syntax in your reply — functions are called silently through the API.",
-    "",
-    "=== KNOWLEDGE BASE ===",
-    loadKnowledge(),
+    // Wording matters here: earlier phrasing that mentioned "function-call
+    // syntax" taught Llama to emit literal <function=...> text, which Groq
+    // rejects with tool_use_failed.
+    "7. Never mention functions, tools, or JSON to the customer. Use the tools API to call functions; your text reply must contain only plain spoken English.",
+    ...(mode === "retrieved"
+      ? ["", "=== KNOWLEDGE BASE (most relevant entries for this customer's question) ===", retrievedKnowledge]
+      : mode === "inline"
+        ? ["", "=== KNOWLEDGE BASE ===", loadKnowledge()]
+        : []),
   ].join("\n");
 }
 
